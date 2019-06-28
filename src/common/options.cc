@@ -7731,6 +7731,10 @@ std::vector<Option> get_mds_options() {
     .set_default(true)
     .set_description("additional reply to clients that metadata requests are complete but not yet durable"),
 
+    Option("mds_complete_all_replay_when_restart", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("complete all the replay request when mds is restarted, no matter the session exists or not"),
+
     Option("mds_default_dir_hash", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(CEPH_STR_HASH_RJENKINS)
     .set_description("hash function to select directory fragment for dentry name"),

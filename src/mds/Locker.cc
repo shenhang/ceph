@@ -1907,6 +1907,8 @@ Capability* Locker::issue_new_caps(CInode *in,
   dout(7) << "issue_new_caps for mode " << mode << " on " << *in << dendl;
   bool is_new;
 
+  if (!session)
+    return 0;
   // if replay, try to reconnect cap, and otherwise do nothing.
   if (is_replay)
     return mds->mdcache->try_reconnect_cap(in, session);

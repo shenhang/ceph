@@ -205,29 +205,30 @@ void Server::dispatch(const cref_t<Message> &m)
     return;
   }
 
+  bool sessionnull_isok = g_conf->mds_complete_all_replay_when_restart;
   // active?
   // handle_slave_request()/handle_client_session() will wait if necessary
   if (m->get_type() == CEPH_MSG_CLIENT_REQUEST && !mds->is_active()) {
     const auto &req = ref_cast<MClientRequest>(m);
     if (mds->is_reconnect() || mds->get_want_state() == CEPH_MDS_STATE_RECONNECT) {
       Session *session = mds->get_session(req);
-      if (!session || session->is_closed()) {
-	dout(5) << "session is closed, dropping " << req->get_reqid() << dendl;
-	return;
+      if ((!sessionnull_isok && (!session || session->is_closed())) || (sessionnull_isok && (!session || session->is_closed()) && !req->is_queued_for_replay())) {
+        dout(5) << "session is closed, dropping " << req->get_reqid() << dendl;
+        return;
       }
       bool queue_replay = false;
       if (req->is_replay()) {
 	dout(3) << "queuing replayed op" << dendl;
 	queue_replay = true;
 	if (req->head.ino &&
-	    !session->have_completed_request(req->get_reqid().tid, nullptr)) {
+	    ((sessionnull_isok && !session) || !session->have_completed_request(req->get_reqid().tid, nullptr) )) {
 	  mdcache->add_replay_ino_alloc(inodeno_t(req->head.ino));
 	}
       } else if (req->get_retry_attempt()) {
 	// process completed request in clientreplay stage. The completed request
 	// might have created new file/directorie. This guarantees MDS sends a reply
 	// to client before other request modifies the new file/directorie.
-	if (session->have_completed_request(req->get_reqid().tid, NULL)) {
+	if ((sessionnull_isok && !session) || session->have_completed_request(req->get_reqid().tid, NULL)) {
 	  dout(3) << "queuing completed op" << dendl;
 	  queue_replay = true;
 	}
@@ -2022,7 +2023,7 @@ void Server::reply_client_request(MDRequestRef& mdr, const ref_t<MClientReply> &
     mds->send_message_client(reply, session);
   }
 
-  if (req->is_queued_for_replay() &&
+  if (session && req->is_queued_for_replay() &&
       (mdr->has_completed || reply->get_result() < 0)) {
     if (reply->get_result() < 0) {
       int r = reply->get_result();
@@ -2143,6 +2144,7 @@ void Server::handle_client_request(const cref_t<MClientRequest> &req)
     mdcache->wait_for_open(new C_MDS_RetryMessage(mds, req));
     return;
   }
+  bool sessionnull_isok = g_conf->mds_complete_all_replay_when_restart;
 
   // active session?
   Session *session = 0;
@@ -2157,9 +2159,16 @@ void Server::handle_client_request(const cref_t<MClientRequest> &req)
       session = NULL;
     }
     if (!session) {
-      if (req->is_queued_for_replay())
-	mds->queue_one_replay();
-      return;
+      if (req->is_queued_for_replay() && !sessionnull_isok) {
+        mds->queue_one_replay();
+        req->put();
+        return;
+      }
+
+      if (!req->is_queued_for_replay()) {
+          req->put();
+          return;
+      }
     }
   }
 
@@ -2172,9 +2181,9 @@ void Server::handle_client_request(const cref_t<MClientRequest> &req)
   // completed request?
   bool has_completed = false;
   if (req->is_replay() || req->get_retry_attempt()) {
-    ceph_assert(session);
+    assert(session || (sessionnull_isok && req->is_queued_for_replay()));
     inodeno_t created;
-    if (session->have_completed_request(req->get_reqid().tid, &created)) {
+    if (session && session->have_completed_request(req->get_reqid().tid, &created)) {
       has_completed = true;
       // Don't send traceless reply if the completed request has created
       // new inode. Treat the request as lookup request instead.
@@ -2207,7 +2216,7 @@ void Server::handle_client_request(const cref_t<MClientRequest> &req)
   }
 
   // trim completed_request list
-  if (req->get_oldest_client_tid() > 0) {
+  if (session && req->get_oldest_client_tid() > 0) {
     dout(15) << " oldest_client_tid=" << req->get_oldest_client_tid() << dendl;
     ceph_assert(session);
     if (session->trim_completed_requests(req->get_oldest_client_tid())) {
@@ -3095,7 +3104,7 @@ CInode* Server::prepare_new_inode(MDRequestRef& mdr, CDir *dir, inodeno_t useino
   // state. In that corner case, session's prealloc_inos are being freed.
   // To simplify the code, we disallow using/refilling session's prealloc_ino
   // while session is opening.
-  bool allow_prealloc_inos = !mdr->session->is_opening();
+  bool allow_prealloc_inos = mdr->session && !mdr->session->is_opening();
 
   // assign ino
   if (allow_prealloc_inos &&
@@ -3217,14 +3226,14 @@ void Server::apply_allocated_inos(MDRequestRef& mdr, Session *session)
   if (mdr->alloc_ino) {
     mds->inotable->apply_alloc_id(mdr->alloc_ino);
   }
-  if (mdr->prealloc_inos.size()) {
+  if (session && mdr->prealloc_inos.size()) {
     ceph_assert(session);
     session->pending_prealloc_inos.subtract(mdr->prealloc_inos);
     session->info.prealloc_inos.insert(mdr->prealloc_inos);
     mds->sessionmap.mark_dirty(session, !mdr->used_prealloc_ino);
     mds->inotable->apply_alloc_ids(mdr->prealloc_inos);
   }
-  if (mdr->used_prealloc_ino) {
+  if (session && mdr->used_prealloc_ino) {
     ceph_assert(session);
     session->info.used_inos.erase(mdr->used_prealloc_ino);
     mds->sessionmap.mark_dirty(session);
